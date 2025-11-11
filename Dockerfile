@@ -1,6 +1,6 @@
-FROM edgeimpulse/learning-block:latest
+FROM python:3.11-slim
 
-RUN pip3 install --no-cache-dir scikit-learn joblib
+RUN pip install --no-cache-dir scikit-learn joblib numpy
 
-COPY . /app
 WORKDIR /app
+COPY . /app
