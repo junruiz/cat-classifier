@@ -1,0 +1,5 @@
+version: 1
+name: rf-cat-block
+description: Random forest classifier for cat IMU data
+type: machine-learning
+dockerfile: Dockerfile
