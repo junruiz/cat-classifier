@@ -4,26 +4,34 @@ import json
 import pickle
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-
-def load_data(data_dir):
-    X_train = np.load(os.path.join(data_dir, "X_split_train.npy"))
-    X_test = np.load(os.path.join(data_dir, "X_split_test.npy"))
-    Y_train = np.load(os.path.join(data_dir, "Y_split_train.npy"))
-    Y_test = np.load(os.path.join(data_dir, "Y_split_test.npy"))
-    y_train = Y_train[:, 0].astype(int)
-    y_test = Y_test[:, 0].astype(int)
-    return X_train, y_train, X_test, y_test
+from sklearn.model_selection import train_test_split
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-directory", required=True)
-    parser.add_argument("--out-directory", required=True)
-    parser.add_argument("--info-file")
-    parser.add_argument("--epochs")
-    parser.add_argument("--learning-rate")
-    args, _ = parser.parse_known_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--data-directory", required=True)
+    p.add_argument("--out-directory", required=True)
+    p.add_argument("--info-file")
+    args, _ = p.parse_known_args()
 
-    X_train, y_train, X_test, y_test = load_data(args.data_directory)
+    d = args.data_directory
+    X_tr = np.load(os.path.join(d, "X_split_train.npy"))
+    Y_tr = np.load(os.path.join(d, "Y_split_train.npy"))
+    X_te = np.load(os.path.join(d, "X_split_test.npy"))
+    Y_te = np.load(os.path.join(d, "Y_split_test.npy"))
+
+    y_tr = np.argmax(Y_tr, axis=1).astype(int)
+    y_te = np.argmax(Y_te, axis=1).astype(int)
+
+    X_all = np.concatenate([X_tr, X_te], axis=0)
+    y_all = np.concatenate([y_tr, y_te], axis=0)
+
+    try:
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_all, y_all, test_size=0.2, stratify=y_all, random_state=42
+        )
+    except ValueError:
+        X_train, y_train = X_all, y_all
+        X_val, y_val = X_te, y_te
 
     clf = RandomForestClassifier(
         n_estimators=200,
@@ -32,8 +40,7 @@ def main():
         random_state=42,
     )
     clf.fit(X_train, y_train)
-
-    acc = clf.score(X_test, y_test) if X_test.size else 0.0
+    val_acc = clf.score(X_val, y_val) if X_val.size else 0.0
 
     os.makedirs(args.out_directory, exist_ok=True)
     with open(os.path.join(args.out_directory, "model.pkl"), "wb") as f:
@@ -42,9 +49,12 @@ def main():
     with open(os.path.join(args.out_directory, "training_log.json"), "w") as f:
         json.dump(
             {
-                "score": float(acc),
+                "score": float(val_acc),
+                "train_labels": sorted(set(y_train.tolist())),
+                "val_labels": sorted(set(y_val.tolist())),
+                "all_labels": sorted(set(y_all.tolist())),
                 "train_samples": int(len(y_train)),
-                "test_samples": int(len(y_test)),
+                "val_samples": int(len(y_val)),
             },
             f,
         )
