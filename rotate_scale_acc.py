@@ -4,7 +4,7 @@ import cbor2
 
 SCALE = 9.81
 
-def main(infile):
+def process_file(infile):
     with open(infile, "rb") as f:
         data = cbor2.load(f)
 
@@ -39,8 +39,15 @@ def main(infile):
     outname = os.path.splitext(infile)[0] + "_acc.cbor"
     with open(outname, "wb") as f:
         cbor2.dump(data, f)
-
     print("written:", outname)
+
+def main(path):
+    if os.path.isfile(path):
+        process_file(path)
+    else:
+        for name in os.listdir(path):
+            if name.lower().endswith(".cbor"):
+                process_file(os.path.join(path, name))
 
 if __name__ == "__main__":
     main(sys.argv[1])
