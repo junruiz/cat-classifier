@@ -202,6 +202,10 @@ def main():
     p.add_argument("--info-file")
     p.add_argument("--min-confidence", type=float, default=0.0)
     p.add_argument("--uncertain-label", type=str, default="uncertain")
+
+    # NEW: sharpen the exported probabilities (smaller => more confident)
+    p.add_argument("--sharpen-temperature", type=float, default=0.5)
+
     args, _ = p.parse_known_args()
 
     d = args.data_directory
@@ -232,6 +236,9 @@ def main():
     T = 2.0
     alpha = 0.7
     min_conf = float(args.min_confidence)
+    sharp_T = float(args.sharpen_temperature)
+    if sharp_T <= 0:
+        sharp_T = 0.5
 
     teacher = RandomForestClassifier(
         n_estimators=200,
@@ -324,8 +331,9 @@ def main():
         callbacks=cb,
     )
 
+    # --- Evaluate with sharpened probs (to match exported behavior) ---
     val_logits = student_logits(X_val, training=False)
-    val_probs = tf.nn.softmax(val_logits, axis=-1).numpy().astype(np.float32)
+    val_probs = tf.nn.softmax(val_logits / sharp_T, axis=-1).numpy().astype(np.float32)
 
     stats_val = eval_probs(
         val_probs,
@@ -334,17 +342,21 @@ def main():
         uncertain_index=uncertain_index,
     )
 
+    # --- Export a probability-output model (sharpened) for EI ---
     inputs = tf.keras.Input(shape=(input_dim,))
     logits = student_logits(inputs)
-    probs = tf.keras.layers.Softmax()(logits)
+
+    probs = tf.nn.softmax(logits / sharp_T, axis=-1)  # <-- sharpened softmax
     student_probs = tf.keras.Model(inputs, probs)
 
+    # TFLite float model
     converter_fp = tf.lite.TFLiteConverter.from_keras_model(student_probs)
     tflite_fp = converter_fp.convert()
     fp_path = os.path.join(out_dir, "model.tflite")
     with open(fp_path, "wb") as f:
         f.write(tflite_fp)
 
+    # TFLite INT8 weights + INT8 input, float32 output
     converter = tf.lite.TFLiteConverter.from_keras_model(student_probs)
 
     def rep_data():
@@ -387,6 +399,7 @@ def main():
     print("Labels:", label_names)
     print("Uncertain index:", uncertain_index)
     print("Min confidence:", float(min_conf))
+    print("Sharpen temperature:", float(sharp_T))
 
     print("Val acc (raw):", float(stats_val["acc_raw"]))
     print("Val acc (thresholded):", float(stats_val["acc_thresholded"]))
@@ -419,6 +432,7 @@ def main():
                 "min_confidence": float(min_conf),
                 "uncertain_label": str(args.uncertain_label),
                 "uncertain_index": uncertain_index,
+                "sharpen_temperature": float(sharp_T),
                 "train_samples": int(len(y_tr)),
                 "val_samples": int(len(y_val)),
                 "input_dim": input_dim,
