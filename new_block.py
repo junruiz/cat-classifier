@@ -25,15 +25,104 @@ def expand_probs(P, present_classes, num_classes):
     return full / np.clip(s, 1e-9, None)
 
 
-def eval_tflite(tflite_path, X, y, int8_io=False):
+def _find_label_list(obj, num_classes):
+    if isinstance(obj, dict):
+        for k in ["labels", "categories", "class_names", "classes", "label_names"]:
+            v = obj.get(k, None)
+            if isinstance(v, list) and len(v) == num_classes:
+                return [str(x) for x in v]
+        for _, v in obj.items():
+            out = _find_label_list(v, num_classes)
+            if out is not None:
+                return out
+    elif isinstance(obj, list):
+        for v in obj:
+            out = _find_label_list(v, num_classes)
+            if out is not None:
+                return out
+    return None
+
+
+def load_label_names(info_file, num_classes):
+    if not info_file:
+        return None
+    try:
+        with open(info_file, "r") as f:
+            info = json.load(f)
+        names = _find_label_list(info, num_classes)
+        return names
+    except Exception:
+        return None
+
+
+def apply_confidence_threshold(probs, min_conf, uncertain_index=None):
+    probs = probs.astype(np.float32)
+    pred = np.argmax(probs, axis=1).astype(int)
+    best = np.max(probs, axis=1).astype(np.float32)
+    accepted = best >= float(min_conf)
+
+    if uncertain_index is not None:
+        pred2 = pred.copy()
+        pred2[~accepted] = int(uncertain_index)
+        return pred2, accepted
+
+    return pred, accepted
+
+
+def eval_probs(probs, y_true, min_conf=None, uncertain_index=None):
+    y_true = y_true.astype(int)
+    pred_raw = np.argmax(probs, axis=1).astype(int)
+    acc_raw = float(np.mean(pred_raw == y_true)) if probs.size else 0.0
+
+    out = {
+        "acc_raw": acc_raw,
+        "coverage": 1.0,
+        "acc_thresholded": acc_raw,
+        "acc_on_accepted": acc_raw,
+    }
+
+    if min_conf is None:
+        return out
+
+    pred_thr, accepted = apply_confidence_threshold(
+        probs, min_conf=min_conf, uncertain_index=uncertain_index
+    )
+    coverage = float(np.mean(accepted)) if accepted.size else 0.0
+    acc_thr = float(np.mean(pred_thr == y_true)) if probs.size else 0.0
+
+    if np.any(accepted):
+        acc_on_accepted = float(np.mean(pred_raw[accepted] == y_true[accepted]))
+    else:
+        acc_on_accepted = 0.0
+
+    out.update(
+        {
+            "coverage": coverage,
+            "acc_thresholded": acc_thr,
+            "acc_on_accepted": acc_on_accepted,
+        }
+    )
+    return out
+
+
+def eval_tflite(
+    tflite_path,
+    X,
+    y,
+    int8_io=False,
+    min_conf=None,
+    uncertain_index=None,
+):
     interpreter = tf.lite.Interpreter(model_path=tflite_path)
     interpreter.allocate_tensors()
 
     in_detail = interpreter.get_input_details()[0]
     out_detail = interpreter.get_output_details()[0]
 
-    correct = 0
     n = int(X.shape[0])
+    correct_raw = 0
+    correct_thr = 0
+    accepted_cnt = 0
 
     in_scale, in_zp = in_detail.get("quantization", (0.0, 0))
     out_scale, out_zp = out_detail.get("quantization", (0.0, 0))
@@ -56,12 +145,54 @@ def eval_tflite(tflite_path, X, y, int8_io=False):
 
         if out_detail["dtype"] == np.int8 and out_scale and out_scale > 0:
             out = (out.astype(np.float32) - out_zp) * out_scale
+        else:
+            out = out.astype(np.float32)
 
-        pred = int(np.argmax(out, axis=1)[0])
+        p = out[0]
+        pred = int(np.argmax(p))
         if pred == int(y[i]):
-            correct += 1
+            correct_raw += 1
 
-    return correct / max(1, n)
+        if min_conf is None:
+            continue
+
+        best = float(np.max(p))
+        accepted = best >= float(min_conf)
+        if accepted:
+            accepted_cnt += 1
+
+        if (not accepted) and (uncertain_index is not None):
+            pred2 = int(uncertain_index)
+        else:
+            pred2 = pred
+
+        if pred2 == int(y[i]):
+            correct_thr += 1
+
+    acc_raw = correct_raw / max(1, n)
+
+    if min_conf is None:
+        return {
+            "acc_raw": float(acc_raw),
+            "coverage": 1.0,
+            "acc_thresholded": float(acc_raw),
+            "acc_on_accepted": float(acc_raw),
+        }
+
+    coverage = accepted_cnt / max(1, n)
+    acc_thr = correct_thr / max(1, n)
+
+    if accepted_cnt > 0:
+        acc_on_accepted = correct_raw / accepted_cnt
+    else:
+        acc_on_accepted = 0.0
+
+    return {
+        "acc_raw": float(acc_raw),
+        "coverage": float(coverage),
+        "acc_thresholded": float(acc_thr),
+        "acc_on_accepted": float(acc_on_accepted),
+    }
 
 
 def main():
@@ -69,6 +200,8 @@ def main():
     p.add_argument("--data-directory", required=True)
     p.add_argument("--out-directory", required=True)
     p.add_argument("--info-file")
+    p.add_argument("--min-confidence", type=float, default=0.70)
+    p.add_argument("--uncertain-label", type=str, default="uncertain")
     args, _ = p.parse_known_args()
 
     d = args.data_directory
@@ -86,10 +219,20 @@ def main():
     num_classes = int(Y_tr.shape[1])
     input_dim = int(X_tr.shape[1])
 
+    label_names = load_label_names(args.info_file, num_classes)
+    if label_names is None:
+        label_names = [str(i) for i in range(num_classes)]
+
+    uncertain_index = None
+    for i, name in enumerate(label_names):
+        if str(name).strip().lower() == str(args.uncertain_label).strip().lower():
+            uncertain_index = i
+            break
+
     T = 2.0
     alpha = 0.7
+    min_conf = float(args.min_confidence)
 
-    # Teacher
     teacher = RandomForestClassifier(
         n_estimators=200,
         n_jobs=-1,
@@ -111,7 +254,6 @@ def main():
     with open(os.path.join(out_dir, "teacher_rf.pkl"), "wb") as f:
         pickle.dump(teacher, f)
 
-    # Student (hard + soft)
     Yhard_tr = tf.keras.utils.to_categorical(y_tr, num_classes).astype(np.float32)
     Yhard_val = tf.keras.utils.to_categorical(y_val, num_classes).astype(np.float32)
 
@@ -157,8 +299,8 @@ def main():
         def result(self):
             return self.acc.result()
 
-        def reset_states(self):
-            self.acc.reset_states()
+        def reset_state(self):
+            self.acc.reset_state()
 
     student_logits.compile(
         optimizer=tf.keras.optimizers.Adam(1e-3),
@@ -182,25 +324,27 @@ def main():
         callbacks=cb,
     )
 
-    # Hard-label accuracy on X_split_test
     val_logits = student_logits(X_val, training=False)
-    student_pred_val = tf.argmax(val_logits, axis=-1).numpy()
-    student_val_acc = float(np.mean(student_pred_val == y_val)) if X_val.size else 0.0
+    val_probs = tf.nn.softmax(val_logits, axis=-1).numpy().astype(np.float32)
 
-    # Export a probability-output model for EI metrics
+    stats_val = eval_probs(
+        val_probs,
+        y_val,
+        min_conf=min_conf,
+        uncertain_index=uncertain_index,
+    )
+
     inputs = tf.keras.Input(shape=(input_dim,))
     logits = student_logits(inputs)
     probs = tf.keras.layers.Softmax()(logits)
     student_probs = tf.keras.Model(inputs, probs)
 
-    # TFLite float model (preferred for EI metrics)
     converter_fp = tf.lite.TFLiteConverter.from_keras_model(student_probs)
     tflite_fp = converter_fp.convert()
     fp_path = os.path.join(out_dir, "model.tflite")
     with open(fp_path, "wb") as f:
         f.write(tflite_fp)
 
-    # TFLite INT8 weights + INT8 input, float32 output
     converter = tf.lite.TFLiteConverter.from_keras_model(student_probs)
 
     def rep_data():
@@ -219,33 +363,72 @@ def main():
     with open(int8_path, "wb") as f:
         f.write(tflite_int8)
 
-    # Sanity check: evaluate exported models on X_split_test
-    tflite_float32_acc = eval_tflite(fp_path, X_val, y_val, int8_io=False)
-    tflite_int8_acc = eval_tflite(int8_path, X_val, y_val, int8_io=True)
+    stats_tflite_fp = eval_tflite(
+        fp_path,
+        X_val,
+        y_val,
+        int8_io=False,
+        min_conf=min_conf,
+        uncertain_index=uncertain_index,
+    )
+    stats_tflite_int8 = eval_tflite(
+        int8_path,
+        X_val,
+        y_val,
+        int8_io=True,
+        min_conf=min_conf,
+        uncertain_index=uncertain_index,
+    )
 
-    print("TFLite float32 accuracy:", float(tflite_float32_acc))
-    print("TFLite int8 accuracy:", float(tflite_int8_acc))
+    print("Output directory:", out_dir)
+    print("Saved:", fp_path)
+    print("Saved:", int8_path)
+    print("Saved:", os.path.join(out_dir, "teacher_rf.pkl"))
+    print("Labels:", label_names)
+    print("Uncertain index:", uncertain_index)
+    print("Min confidence:", float(min_conf))
 
-    # Log for EI
+    print("Val acc (raw):", float(stats_val["acc_raw"]))
+    print("Val acc (thresholded):", float(stats_val["acc_thresholded"]))
+    print("Val coverage:", float(stats_val["coverage"]))
+    print("Val acc on accepted:", float(stats_val["acc_on_accepted"]))
+
+    print("TFLite float32 acc (raw):", float(stats_tflite_fp["acc_raw"]))
+    print("TFLite float32 acc (thresholded):", float(stats_tflite_fp["acc_thresholded"]))
+    print("TFLite int8 acc (raw):", float(stats_tflite_int8["acc_raw"]))
+    print("TFLite int8 acc (thresholded):", float(stats_tflite_int8["acc_thresholded"]))
+
     with open(os.path.join(out_dir, "training_log.json"), "w") as f:
         json.dump(
             {
-                "score": float(tflite_float32_acc),
+                "score": float(stats_tflite_fp["acc_raw"]),
                 "teacher_train_acc": teacher_train_acc,
                 "teacher_val_acc": teacher_val_acc,
-                "student_val_acc_hard": student_val_acc,
-                "tflite_float32_acc": float(tflite_float32_acc),
-                "tflite_int8_acc": float(tflite_int8_acc),
+                "val_acc_raw": float(stats_val["acc_raw"]),
+                "val_acc_thresholded": float(stats_val["acc_thresholded"]),
+                "val_coverage": float(stats_val["coverage"]),
+                "val_acc_on_accepted": float(stats_val["acc_on_accepted"]),
+                "tflite_float32_acc_raw": float(stats_tflite_fp["acc_raw"]),
+                "tflite_float32_acc_thresholded": float(stats_tflite_fp["acc_thresholded"]),
+                "tflite_float32_coverage": float(stats_tflite_fp["coverage"]),
+                "tflite_int8_acc_raw": float(stats_tflite_int8["acc_raw"]),
+                "tflite_int8_acc_thresholded": float(stats_tflite_int8["acc_thresholded"]),
+                "tflite_int8_coverage": float(stats_tflite_int8["coverage"]),
                 "distill_T": T,
                 "distill_alpha": alpha,
+                "min_confidence": float(min_conf),
+                "uncertain_label": str(args.uncertain_label),
+                "uncertain_index": uncertain_index,
                 "train_samples": int(len(y_tr)),
                 "val_samples": int(len(y_val)),
                 "input_dim": input_dim,
                 "num_classes": num_classes,
+                "labels": label_names,
                 "outputs": [
                     "model.tflite",
                     "model_quantized_int8_io.tflite",
                     "teacher_rf.pkl",
+                    "training_log.json",
                 ],
             },
             f,
