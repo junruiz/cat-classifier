@@ -200,7 +200,7 @@ def main():
     p.add_argument("--data-directory", required=True)
     p.add_argument("--out-directory", required=True)
     p.add_argument("--info-file")
-    p.add_argument("--min-confidence", type=float, default=0.70)
+    p.add_argument("--min-confidence", type=float, default=0.60)
     p.add_argument("--uncertain-label", type=str, default="uncertain")
     args, _ = p.parse_known_args()
 
