@@ -5,7 +5,6 @@ import pickle
 import numpy as np
 
 from sklearn.ensemble import RandomForestClassifier
-
 import tensorflow as tf
 
 
@@ -122,7 +121,7 @@ def main():
     Ymix_tr = np.concatenate([Yhard_tr, P_tr_T], axis=1).astype(np.float32)
     Ymix_val = np.concatenate([Yhard_val, P_val_T], axis=1).astype(np.float32)
 
-    student = tf.keras.Sequential(
+    student_logits = tf.keras.Sequential(
         [
             tf.keras.layers.Input(shape=(input_dim,)),
             tf.keras.layers.Dense(64, activation="relu"),
@@ -144,15 +143,27 @@ def main():
 
         return tf.reduce_mean((1.0 - alpha) * hard + alpha * (T * T) * soft)
 
-    def hard_acc(y_mix, logits):
-        y_hard = y_mix[:, :num_classes]
-        pred = tf.nn.softmax(logits, axis=-1)
-        return tf.keras.metrics.categorical_accuracy(y_hard, pred)
+    class HardAccuracy(tf.keras.metrics.Metric):
+        def __init__(self, num_classes, name="accuracy", **kwargs):
+            super().__init__(name=name, **kwargs)
+            self.num_classes = num_classes
+            self.acc = tf.keras.metrics.CategoricalAccuracy()
 
-    student.compile(
+        def update_state(self, y_mix, y_pred, sample_weight=None):
+            y_hard = y_mix[:, : self.num_classes]
+            y_prob = tf.nn.softmax(y_pred, axis=-1)
+            return self.acc.update_state(y_hard, y_prob, sample_weight=sample_weight)
+
+        def result(self):
+            return self.acc.result()
+
+        def reset_states(self):
+            self.acc.reset_states()
+
+    student_logits.compile(
         optimizer=tf.keras.optimizers.Adam(1e-3),
         loss=distill_loss,
-        metrics=[hard_acc],
+        metrics=[HardAccuracy(num_classes, name="accuracy")],
     )
 
     cb = [
@@ -161,7 +172,7 @@ def main():
         )
     ]
 
-    student.fit(
+    student_logits.fit(
         X_tr,
         Ymix_tr,
         validation_data=(X_val, Ymix_val),
@@ -171,12 +182,26 @@ def main():
         callbacks=cb,
     )
 
-    student_probs_val = tf.nn.softmax(student(X_val, training=False), axis=-1).numpy()
-    student_pred_val = np.argmax(student_probs_val, axis=1)
+    # Hard-label accuracy on X_split_test
+    val_logits = student_logits(X_val, training=False)
+    student_pred_val = tf.argmax(val_logits, axis=-1).numpy()
     student_val_acc = float(np.mean(student_pred_val == y_val)) if X_val.size else 0.0
 
-    # Export
-    converter = tf.lite.TFLiteConverter.from_keras_model(student)
+    # Export a probability-output model for EI metrics
+    inputs = tf.keras.Input(shape=(input_dim,))
+    logits = student_logits(inputs)
+    probs = tf.keras.layers.Softmax()(logits)
+    student_probs = tf.keras.Model(inputs, probs)
+
+    # TFLite float model (preferred for EI metrics)
+    converter_fp = tf.lite.TFLiteConverter.from_keras_model(student_probs)
+    tflite_fp = converter_fp.convert()
+    fp_path = os.path.join(out_dir, "model.tflite")
+    with open(fp_path, "wb") as f:
+        f.write(tflite_fp)
+
+    # TFLite INT8 weights + INT8 input, float32 output
+    converter = tf.lite.TFLiteConverter.from_keras_model(student_probs)
 
     def rep_data():
         n = min(500, X_tr.shape[0])
@@ -187,28 +212,25 @@ def main():
     converter.representative_dataset = rep_data
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     converter.inference_input_type = tf.int8
-    converter.inference_output_type = tf.int8
+    converter.inference_output_type = tf.float32
 
     tflite_int8 = converter.convert()
     int8_path = os.path.join(out_dir, "model_quantized_int8_io.tflite")
     with open(int8_path, "wb") as f:
         f.write(tflite_int8)
 
-    converter_fp = tf.lite.TFLiteConverter.from_keras_model(student)
-    tflite_fp = converter_fp.convert()
-    fp_path = os.path.join(out_dir, "model.tflite")
-    with open(fp_path, "wb") as f:
-        f.write(tflite_fp)
-
+    # Sanity check: evaluate exported models on X_split_test
     tflite_float32_acc = eval_tflite(fp_path, X_val, y_val, int8_io=False)
     tflite_int8_acc = eval_tflite(int8_path, X_val, y_val, int8_io=True)
 
     print("TFLite float32 accuracy:", float(tflite_float32_acc))
     print("TFLite int8 accuracy:", float(tflite_int8_acc))
 
+    # Log for EI
     with open(os.path.join(out_dir, "training_log.json"), "w") as f:
         json.dump(
             {
+                "score": float(tflite_float32_acc),
                 "teacher_train_acc": teacher_train_acc,
                 "teacher_val_acc": teacher_val_acc,
                 "student_val_acc_hard": student_val_acc,
@@ -221,8 +243,8 @@ def main():
                 "input_dim": input_dim,
                 "num_classes": num_classes,
                 "outputs": [
-                    "model_quantized_int8_io.tflite",
                     "model.tflite",
+                    "model_quantized_int8_io.tflite",
                     "teacher_rf.pkl",
                 ],
             },
